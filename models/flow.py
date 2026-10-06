@@ -1,4 +1,4 @@
-"""Optimal-transport flow matching and Euler sampling utilities."""
+"""Optimal-transport flow matching and Euler sampling utilities with normalized deep supervision."""
 
 from __future__ import annotations
 
@@ -14,19 +14,19 @@ def deep_supervision_weights(
     num_loops: int,
     weighting: str = "exponential",
 ) -> torch.Tensor:
-    """Return one multiplier for each intermediate exit, indexed by ``r - 1``.
+    """Return normalized multipliers for all exits (1 to num_loops).
 
-    The final exit has an implicit loss weight of one.  Exponential weighting
-    makes earlier exits weaker while keeping the final intermediate multiplier
-    at one, so the final prediction remains the dominant supervision signal.
+    Normalized so the sum of all exit weights equals 2.0, matching OpenSenseNova standard.
     """
     if num_loops <= 0:
         raise ValueError("num_loops must be positive")
     if weighting == "exponential":
-        return torch.pow(2.0, torch.arange(1 - num_loops, 1, dtype=torch.float32))
-    if weighting == "uniform":
-        return torch.ones(num_loops, dtype=torch.float32)
-    raise ValueError("weighting must be 'exponential' or 'uniform'")
+        raw = torch.pow(2.0, torch.arange(1 - num_loops, 1, dtype=torch.float32))
+    elif weighting == "uniform":
+        raw = torch.ones(num_loops, dtype=torch.float32)
+    else:
+        raise ValueError("weighting must be 'exponential' or 'uniform'")
+    return raw * (2.0 / raw.sum())
 
 
 def _model_dtype(model: nn.Module, fallback: torch.dtype) -> torch.dtype:
@@ -42,17 +42,6 @@ def _prediction(result: Any) -> torch.Tensor:
     return result
 
 
-def _exit_weight(
-    exit_weights: torch.Tensor | Mapping[int, float] | list[float] | tuple[float, ...],
-    loop_index: int,
-) -> float:
-    if isinstance(exit_weights, Mapping):
-        return float(exit_weights.get(loop_index, 0.0))
-    if loop_index > len(exit_weights):
-        return 0.0
-    return float(exit_weights[loop_index - 1])
-
-
 def training_loss(
     model: nn.Module,
     x1: torch.Tensor,
@@ -63,7 +52,7 @@ def training_loss(
     num_loops: int | None = None,
     weighting: str = "exponential",
 ) -> torch.Tensor:
-    """Compute OT flow-matching MSE with optional deep-supervision exits."""
+    """Compute OT flow-matching MSE with normalized deep-supervision exits."""
     if x1.ndim < 2:
         raise ValueError("x1 must include a batch dimension")
     batch_size = x1.shape[0]
@@ -84,7 +73,14 @@ def training_loss(
     if num_loops <= 0:
         raise ValueError("num_loops must be positive")
     if exit_weights is None:
-        exit_weights = deep_supervision_weights(num_loops, weighting)
+        weights = deep_supervision_weights(num_loops, weighting).to(device=x1.device)
+    else:
+        if isinstance(exit_weights, (list, tuple)):
+            weights = torch.tensor(exit_weights, device=x1.device, dtype=torch.float32)
+        elif isinstance(exit_weights, Mapping):
+            weights = torch.tensor([exit_weights.get(i + 1, 1.0) for i in range(num_loops)], device=x1.device, dtype=torch.float32)
+        else:
+            weights = exit_weights.to(device=x1.device, dtype=torch.float32)
 
     view_shape = (batch_size,) + (1,) * (x1.ndim - 1)
     interpolation = t.reshape(view_shape)
@@ -99,11 +95,13 @@ def training_loss(
         num_loops=num_loops,
         exit_loops=requested_exits,
     )
-    loss = F.mse_loss(prediction.float(), target.float())
+    # Final exit is index -1 in weights
+    final_weight = float(weights[-1].item()) if len(weights) >= num_loops else 1.0
+    loss = final_weight * F.mse_loss(prediction.float(), target.float())
     for loop_index, exit_prediction in exits.items():
-        weight = _exit_weight(exit_weights, loop_index)
-        if weight:
-            loss = loss + weight * F.mse_loss(exit_prediction.float(), target.float())
+        w = float(weights[loop_index - 1].item()) if loop_index <= len(weights) else 0.0
+        if w > 0.0:
+            loss = loss + w * F.mse_loss(exit_prediction.float(), target.float())
     return loss
 
 

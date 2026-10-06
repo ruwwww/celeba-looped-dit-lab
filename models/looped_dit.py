@@ -1,4 +1,11 @@
-"""Looped DiT backbone for 32-channel 16x16 VAE latents."""
+"""Looped DiT backbone for 32-channel 16x16 VAE latents with stabilized dynamics.
+
+Incorporates:
+1. QK-Norm (RMSNorm on Query and Key) to prevent attention logit drift.
+2. Exact token-aligned XSA (Exclusive Self-Attention) per head.
+3. Bounded adaLN modulation to prevent compound exponential scaling across recurrent loops.
+4. Loop-boundary RMSNorm to stabilize hidden representations over multiple loop passes.
+"""
 
 from __future__ import annotations
 
@@ -10,35 +17,58 @@ import torch.nn.functional as F
 from torch import nn
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps) * self.weight
+
+
+def timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 10_000) -> torch.Tensor:
+    """Create sinusoidal embeddings for scalar timesteps."""
+    timesteps = timesteps.reshape(-1).float()
+    half = dim // 2
+    if half == 0:
+        return timesteps[:, None]
+    frequencies = torch.exp(
+        -math.log(max_period)
+        * torch.arange(half, device=timesteps.device, dtype=torch.float32)
+        / max(half - 1, 1)
+    )
+    arguments = timesteps[:, None] * frequencies[None, :]
+    embedding = torch.cat((torch.cos(arguments), torch.sin(arguments)), dim=-1)
+    if dim % 2:
+        embedding = torch.cat((embedding, torch.zeros_like(embedding[:, :1])), dim=-1)
+    return embedding
+
+
 class TimestepEmbedder(nn.Module):
-    """Sinusoidal timestep features followed by a learned projection."""
+    """Sinusoidal timestep features followed by a learned 2-layer projection."""
 
     def __init__(self, hidden_size: int, frequency_size: int | None = None) -> None:
         super().__init__()
-        frequency_size = frequency_size or hidden_size
-        self.frequency_size = frequency_size
+        self.frequency_size = frequency_size or hidden_size
         self.hidden_size = hidden_size
         self.mlp = nn.Sequential(
-            nn.Linear(frequency_size, hidden_size * 4),
+            nn.Linear(self.frequency_size, hidden_size),
             nn.SiLU(),
-            nn.Linear(hidden_size * 4, hidden_size),
+            nn.Linear(hidden_size, hidden_size),
         )
+        self.norm = RMSNorm(hidden_size)
+        self._initialize_weights()
+
+    def _initialize_weights(self) -> None:
+        nn.init.normal_(self.mlp[0].weight, std=0.02)
+        nn.init.zeros_(self.mlp[0].bias)
+        nn.init.normal_(self.mlp[2].weight, std=0.02)
+        nn.init.zeros_(self.mlp[2].bias)
 
     def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
-        timesteps = timesteps.reshape(-1).float()
-        half = self.frequency_size // 2
-        if half == 0:
-            frequencies = timesteps.new_ones((timesteps.shape[0], 1))
-            embedding = frequencies
-        else:
-            exponent = torch.arange(half, device=timesteps.device, dtype=torch.float32)
-            exponent = exponent / max(half - 1, 1)
-            frequencies = torch.exp(-math.log(10_000.0) * exponent)
-            angles = timesteps[:, None] * frequencies[None, :]
-            embedding = torch.cat((angles.sin(), angles.cos()), dim=-1)
-            if embedding.shape[-1] < self.frequency_size:
-                embedding = F.pad(embedding, (0, self.frequency_size - embedding.shape[-1]))
-        return self.mlp(embedding.to(dtype=self.mlp[0].weight.dtype))
+        sin_cos = timestep_embedding(timesteps, self.frequency_size)
+        return self.norm(self.mlp(sin_cos.to(dtype=self.mlp[0].weight.dtype)))
 
 
 class FeedForward(nn.Module):
@@ -58,6 +88,8 @@ class FeedForward(nn.Module):
 
 
 class SelfAttention(nn.Module):
+    """Multi-head self-attention with QK-Norm and per-head Exclusive Self-Attention (XSA)."""
+
     def __init__(
         self,
         hidden_size: int,
@@ -73,31 +105,43 @@ class SelfAttention(nn.Module):
         self.head_dim = hidden_size // num_heads
         self.dropout = dropout
         self.regulate_attention = regulate_attention
+
         self.qkv = nn.Linear(hidden_size, hidden_size * 3)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
         self.proj = nn.Linear(hidden_size, hidden_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, tokens, channels = x.shape
         qkv = self.qkv(x).reshape(batch, tokens, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, batch, num_heads, tokens, head_dim]
         query, key, value = qkv.unbind(0)
+
+        # QK-Norm prevents query-key inner products from drifting to extremes
+        query = self.q_norm(query)
+        key = self.k_norm(key)
+
         attention = F.scaled_dot_product_attention(
             query,
             key,
             value,
             dropout_p=self.dropout if self.training else 0.0,
         )
-        attention = attention.transpose(1, 2).reshape(batch, tokens, channels)
+
         if self.regulate_attention:
-            value_context = value.transpose(1, 2).reshape(batch, tokens, channels)
-            value_direction = F.normalize(value_context.float(), dim=-1, eps=1e-6).to(attention.dtype)
-            parallel = (attention * value_direction).sum(dim=-1, keepdim=True) * value_direction
-            attention = attention - parallel
+            # Per-head Exclusive Self-Attention (XSA, Zhai 2026):
+            # Remove from each token's attention output the component along its own value vector.
+            v_hat = F.normalize(value.float(), dim=-1, eps=1e-6)
+            att_float = attention.float()
+            parallel = (att_float * v_hat).sum(dim=-1, keepdim=True) * v_hat
+            attention = (att_float - parallel).to(dtype=attention.dtype)
+
+        attention = attention.transpose(1, 2).reshape(batch, tokens, channels)
         return self.proj(attention)
 
 
 class AdaLNBlock(nn.Module):
-    """Transformer block with zero-initialized adaptive LayerNorm gates."""
+    """Transformer block with adaptive LayerNorm and scale bounding."""
 
     def __init__(
         self,
@@ -117,29 +161,40 @@ class AdaLNBlock(nn.Module):
         )
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.mlp = FeedForward(hidden_size, mlp_ratio, dropout=dropout)
-        self.modulation = nn.Linear(hidden_size, hidden_size * 6)
-        nn.init.zeros_(self.modulation.weight)
-        nn.init.zeros_(self.modulation.bias)
+        self.modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size * 6),
+        )
+        self._initialize_weights()
+
+    def _initialize_weights(self) -> None:
+        nn.init.zeros_(self.modulation[1].weight)
+        nn.init.zeros_(self.modulation[1].bias)
 
     def forward(self, x: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
-        shift_attention, scale_attention, gate_attention, shift_mlp, scale_mlp, gate_mlp = (
+        shift_att, scale_att, gate_att, shift_mlp, scale_mlp, gate_mlp = (
             self.modulation(condition).chunk(6, dim=-1)
         )
-        attention_input = self.norm1(x) * (1.0 + scale_attention[:, None, :])
-        attention_input = attention_input + shift_attention[:, None, :]
-        x = x + gate_attention[:, None, :] * self.attention(attention_input)
+        # Numerical protection: clamp scale to [-2, 2] and gate to [-4, 4]
+        # Prevents compounding exponential explosions across recurrent loops
+        scale_att = torch.clamp(scale_att, min=-2.0, max=2.0)
+        scale_mlp = torch.clamp(scale_mlp, min=-2.0, max=2.0)
+        gate_att = torch.clamp(gate_att, min=-4.0, max=4.0)
+        gate_mlp = torch.clamp(gate_mlp, min=-4.0, max=4.0)
 
-        mlp_input = self.norm2(x) * (1.0 + scale_mlp[:, None, :])
-        mlp_input = mlp_input + shift_mlp[:, None, :]
+        attention_input = self.norm1(x) * (1.0 + scale_att[:, None, :]) + shift_att[:, None, :]
+        x = x + gate_att[:, None, :] * self.attention(attention_input)
+
+        mlp_input = self.norm2(x) * (1.0 + scale_mlp[:, None, :]) + shift_mlp[:, None, :]
         return x + gate_mlp[:, None, :] * self.mlp(mlp_input)
 
 
 class LoopedDiT(nn.Module):
-    """A parameter-efficient DiT with a physically shared looped core.
+    """Parameter-efficient DiT with a physically shared looped core and stabilized dynamics.
 
-    The default physical depth is eight blocks: two pre-loop blocks, four
-    shared core blocks, and two post-loop blocks.  Calling the core four times
-    gives an effective depth of twenty blocks without duplicating core weights.
+    Default split: (pre=2, core=4, post=2) with hidden_size=512, mlp_ratio=6.0.
+    Physical parameters: ~49.0M parameters.
+    Effective recurrent depth: 2 + (4 * 4) + 2 = 20 transformer blocks.
     """
 
     def __init__(
@@ -196,49 +251,38 @@ class LoopedDiT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, hidden_size))
         self.time_embed = TimestepEmbedder(hidden_size)
         self.class_embed = nn.Embedding(num_classes + 1, hidden_size)
+        self.condition_norm = RMSNorm(hidden_size)
+        self.loop_norm = RMSNorm(hidden_size)
 
         pre_depth, core_depth, post_depth = self.loop_split
         self.pre_blocks = nn.ModuleList(
-            self._make_block(hidden_size, self.num_heads, mlp_ratio, dropout, False)
+            AdaLNBlock(hidden_size, self.num_heads, mlp_ratio, dropout=dropout, regulate_attention=False)
             for _ in range(pre_depth)
         )
         self.core_blocks = nn.ModuleList(
-            self._make_block(hidden_size, self.num_heads, mlp_ratio, dropout, True)
+            AdaLNBlock(hidden_size, self.num_heads, mlp_ratio, dropout=dropout, regulate_attention=True)
             for _ in range(core_depth)
         )
         self.post_blocks = nn.ModuleList(
-            self._make_block(hidden_size, self.num_heads, mlp_ratio, dropout, False)
+            AdaLNBlock(hidden_size, self.num_heads, mlp_ratio, dropout=dropout, regulate_attention=False)
             for _ in range(post_depth)
         )
         self.final_norm = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.final_modulation = nn.Linear(hidden_size, hidden_size * 2)
+        self.final_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size * 2),
+        )
         self.output_projection = nn.Linear(hidden_size, patch_size * patch_size * in_channels)
 
         self._initialize_weights()
-
-    @staticmethod
-    def _make_block(
-        hidden_size: int,
-        num_heads: int,
-        mlp_ratio: float,
-        dropout: float,
-        regulate_attention: bool,
-    ) -> AdaLNBlock:
-        return AdaLNBlock(
-            hidden_size,
-            num_heads,
-            mlp_ratio,
-            dropout=dropout,
-            regulate_attention=regulate_attention,
-        )
 
     def _initialize_weights(self) -> None:
         nn.init.normal_(self.pos_embed, std=0.02)
         nn.init.normal_(self.class_embed.weight, std=0.02)
         nn.init.xavier_uniform_(self.x_embedder.weight)
         nn.init.zeros_(self.x_embedder.bias)
-        nn.init.zeros_(self.final_modulation.weight)
-        nn.init.zeros_(self.final_modulation.bias)
+        nn.init.zeros_(self.final_modulation[1].weight)
+        nn.init.zeros_(self.final_modulation[1].bias)
         nn.init.zeros_(self.output_projection.weight)
         nn.init.zeros_(self.output_projection.bias)
 
@@ -279,12 +323,15 @@ class LoopedDiT(nn.Module):
             if self.training and self.class_dropout_prob > 0.0:
                 dropped = torch.rand(batch_size, device=labels.device) < self.class_dropout_prob
                 labels = torch.where(dropped, torch.full_like(labels, null_label), labels)
-        return self.time_embed(timesteps) + self.class_embed(labels)
+
+        condition = self.time_embed(timesteps) + self.class_embed(labels)
+        return self.condition_norm(condition)
 
     def _decode(self, hidden: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
         for block in self.post_blocks:
             hidden = block(hidden, condition)
         shift, scale = self.final_modulation(condition).chunk(2, dim=-1)
+        scale = torch.clamp(scale, min=-2.0, max=2.0)
         hidden = self.final_norm(hidden) * (1.0 + scale[:, None, :]) + shift[:, None, :]
         patches = self.output_projection(hidden)
         batch, tokens, channels = patches.shape
@@ -336,6 +383,8 @@ class LoopedDiT(nn.Module):
 
         exits: dict[int, torch.Tensor] = {}
         for loop_index in range(1, num_loops + 1):
+            # Normalize hidden state across loop transitions to prevent compounding drift
+            hidden = self.loop_norm(hidden)
             for block in self.core_blocks:
                 hidden = block(hidden, condition)
             if loop_index in requested:

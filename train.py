@@ -140,7 +140,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--ema-decay", type=float, default=0.9999)
-    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--grad-clip", type=float, default=0.5)
     parser.add_argument("--checkpoint-interval", type=int, default=1_000)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument("--sample-interval", type=int, default=1_000)
