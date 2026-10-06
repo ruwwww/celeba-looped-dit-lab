@@ -240,10 +240,21 @@ def main(argv: list[str] | None = None) -> None:
                     epoch,
                     {"loss": loss.detach().float().item(), "lr": optimizer.param_groups[0]["lr"]},
                 )
-                tracker.plot_loss_curve()
+                if step % (args.log_interval * 5) == 0:
+                    tracker.plot_loss_curve()
+                print(f"epoch={epoch} step={step} loss={loss.item():.4f}", flush=True)
             if step % args.checkpoint_interval == 0 or step == args.max_steps:
                 _save_checkpoint(
                     tracker.checkpoints_dir / f"checkpoint_{step:06d}.pt",
+                    model,
+                    ema,
+                    optimizer,
+                    step,
+                    epoch,
+                    config,
+                )
+                _save_checkpoint(
+                    tracker.checkpoints_dir / "checkpoint_last.pt",
                     model,
                     ema,
                     optimizer,
